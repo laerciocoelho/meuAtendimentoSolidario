@@ -1,0 +1,453 @@
+from flask import Blueprint, request, jsonify
+from database import db
+from models import User, PasswordReset, SorteioAtendimento, Atendimento
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt
+from datetime import datetime, timedelta
+from utils.email_utils import enviar_email
+import re, random
+
+auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+
+
+# ------------------------
+# Funções auxiliares
+# ------------------------
+def serialize_user(u: User):
+    return {
+        "id": u.id,
+        "tipo": u.tipo,
+        "email": u.email,
+        "nome": u.nome,
+        "telefone": u.telefone,
+        "cep": u.cep,
+        "endereco": u.endereco,
+        "bairro": u.bairro,
+        "estado": u.estado,
+        "municipio": u.municipio,
+        "criado_em": u.criado_em.isoformat(),
+        # paciente
+        "cpf": u.cpf,
+        "especialidade_necessaria": u.especialidade_necessaria,
+        "descricao_necessidade": u.descricao_necessidade,
+        # profissional
+        "especialidade": u.especialidade,
+        "local_atendimento": u.local_atendimento,
+        "registro_conselho": u.registro_conselho,
+        "uf_registro": u.uf_registro,
+        "cidade": u.cidade,
+    }
+
+
+def is_cpf_valido(cpf: str) -> bool:
+    if not cpf:
+        return False
+    num = re.sub(r"\D", "", cpf)
+    if len(num) != 11:
+        return False
+    if num == num[0] * 11:
+        return False
+
+    def calc_dv(base: str) -> int:
+        soma = sum(int(d) * (len(base) + 1 - i) for i, d in enumerate(base))
+        resto = soma % 11
+        return 0 if resto < 2 else 11 - resto
+
+    dv1 = calc_dv(num[:9])
+    if dv1 != int(num[9]):
+        return False
+    dv2 = calc_dv(num[:10])
+    if dv2 != int(num[10]):
+        return False
+    return True
+
+
+# ------------------------
+# Cadastro e login
+# ------------------------
+@auth_bp.post("/register/paciente")
+def register_paciente():
+    data = request.get_json() or {}
+    required = [
+        "cpf", "email", "senha", "nome", "telefone", "cep",
+        "endereco", "especialidade_necessaria", "descricao_necessidade",
+        "estado", "municipio",
+    ]
+    if any(not data.get(k) for k in required):
+        return jsonify({"message": "Todos os campos são obrigatórios."}), 400
+
+    cpf_normalizado = re.sub(r"\D", "", data.get("cpf", ""))
+    if not is_cpf_valido(cpf_normalizado):
+        return jsonify({"message": "CPF inválido."}), 400
+
+    if User.query.filter_by(cpf=cpf_normalizado).first():
+        return jsonify({"message": "CPF já cadastrado."}), 409
+
+    user = User(
+        tipo="paciente",
+        cpf=cpf_normalizado,
+        email=data["email"],
+        senha_hash=generate_password_hash(data["senha"]),
+        nome=data["nome"],
+        telefone=data["telefone"],
+        cep=data["cep"],
+        endereco=data["endereco"],
+        bairro=data.get("bairro"),
+        estado=data["estado"],
+        municipio=data["municipio"],
+        especialidade_necessaria=data["especialidade_necessaria"],
+        descricao_necessidade=data["descricao_necessidade"],
+    )
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "Paciente cadastrado com sucesso!", "id": user.id}), 201
+
+
+@auth_bp.post("/register/profissional")
+def register_profissional():
+    data = request.get_json() or {}
+    required = [
+        "email", "senha", "nome",
+        "cep", "endereco", "estado", "municipio",
+        "especialidade", "local_atendimento",
+        "registro_conselho", "uf_registro", "cidade"
+    ]
+    if any(not data.get(k) for k in required):
+        return jsonify({"message": "Todos os campos são obrigatórios, exceto telefone."}), 400
+
+    registro = data["registro_conselho"].strip()
+    uf_registro = data["uf_registro"].strip().upper()
+    existente = User.query.filter_by(
+        tipo="profissional",
+        registro_conselho=registro,
+        uf_registro=uf_registro
+    ).first()
+    if existente:
+        return jsonify({"message": "Registro de conselho já cadastrado para esta UF."}), 409
+
+    user = User(
+        tipo="profissional",
+        email=data["email"],
+        senha_hash=generate_password_hash(data["senha"]),
+        nome=data["nome"],
+        telefone=data.get("telefone"),
+        cep=data["cep"],
+        endereco=data["endereco"],
+        bairro=data.get("bairro"),
+        estado=data["estado"],
+        municipio=data["municipio"],
+        especialidade=data["especialidade"],
+        local_atendimento=data["local_atendimento"],
+        registro_conselho=registro,
+        uf_registro=uf_registro,
+        cidade=data["cidade"],
+    )
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "Profissional cadastrado com sucesso!", "id": user.id}), 201
+
+
+@auth_bp.post("/login")
+def login():
+    data = request.get_json() or {}
+    email = data.get("email")
+    senha = data.get("senha")
+    tipo = data.get("tipo")
+    if not all([email, senha, tipo]):
+        return jsonify({"message": "Informe e-mail, senha e tipo de usuário."}), 400
+
+    user = User.query.filter_by(email=email, tipo=tipo).first()
+    if not user or not check_password_hash(user.senha_hash, senha):
+        return jsonify({"message": "Credenciais inválidas."}), 401
+
+    token = create_access_token(
+        identity=str(user.id),
+        additional_claims={"tipo": user.tipo},
+        expires_delta=timedelta(hours=8)
+    )
+    return jsonify({"access_token": token, "user": serialize_user(user)})
+
+
+@auth_bp.get("/me")
+@jwt_required()
+def me():
+    user = User.query.get(get_jwt_identity())
+    if not user:
+        return jsonify({"message": "Usuário não encontrado"}), 404
+    return jsonify(serialize_user(user))
+
+
+# ------------------------
+# Atendimentos - Paciente
+# ------------------------
+@auth_bp.get("/paciente/atendimentos")
+@jwt_required()
+def listar_atendimentos_paciente():
+    claims = get_jwt()
+    if claims.get("tipo") != "paciente":
+        return jsonify({"message": "Apenas pacientes podem acessar seus atendimentos."}), 403
+
+    paciente_id = get_jwt_identity()
+    atendimentos = (
+        Atendimento.query
+        .filter_by(paciente_id=paciente_id)
+        .order_by(Atendimento.data_inicio.desc())
+        .all()
+    )
+    result = [
+        {
+            "id": a.id,
+            "especialidade": a.especialidade,
+            "status": a.status,
+            "profissional": a.profissional.nome if a.profissional else None,
+            "data_inicio": a.data_inicio.isoformat() if a.data_inicio else None,
+            "data_fim": a.data_fim.isoformat() if a.data_fim else None
+        }
+        for a in atendimentos
+    ]
+    return jsonify(result), 200
+
+
+# ------------------------
+# Sorteios - Paciente
+# ------------------------
+@auth_bp.get("/paciente/sorteios")
+@jwt_required()
+def listar_sorteios_paciente():
+    claims = get_jwt()
+    if claims.get("tipo") != "paciente":
+        return jsonify({"message": "Apenas pacientes podem ver seus sorteios."}), 403
+
+    paciente_id = get_jwt_identity()
+    sorteios = SorteioAtendimento.query.filter_by(paciente_id=paciente_id).all()
+
+    especialidades_vistas = set()
+    result = []
+    for s in sorteios:
+        profissional = User.query.get(s.profissional_id) if s.profissional_id else None
+        esp = profissional.especialidade if profissional else None
+        if esp and esp not in especialidades_vistas:
+            result.append({
+                "id": s.id,
+                "especialidade": esp,
+                "profissional_nome": profissional.nome if profissional else "Aguardando",
+                "profissional_municipio": profissional.municipio if profissional else None,
+                "profissional_estado": profissional.estado if profissional else None,
+                "data_sorteio": s.data_sorteio.isoformat() if s.data_sorteio else None
+            })
+            especialidades_vistas.add(esp)
+    return jsonify(result), 200
+
+
+@auth_bp.post("/paciente/sorteios")
+@jwt_required()
+def criar_sorteio_paciente():
+    claims = get_jwt()
+    if claims.get("tipo") != "paciente":
+        return jsonify({"message": "Apenas pacientes podem se inscrever para sorteios."}), 403
+
+    paciente_id = get_jwt_identity()
+    data = request.get_json() or {}
+    estado = data.get("estado")
+    municipio = data.get("municipio")
+    especialidade = data.get("especialidade")
+    descricao = data.get("descricao")
+
+    if not all([estado, municipio, especialidade, descricao]):
+        return jsonify({"message": "Todos os campos são obrigatórios."}), 400
+
+    agora = datetime.utcnow()
+    # valida duplicidade por especialidade
+    ativo = (
+        SorteioAtendimento.query
+        .join(User, SorteioAtendimento.profissional_id == User.id, isouter=True)
+        .filter(
+            SorteioAtendimento.paciente_id == paciente_id,
+            User.especialidade == especialidade if User.id is not None else True,
+            (SorteioAtendimento.data_expiracao == None) | (SorteioAtendimento.data_expiracao > agora)
+        )
+        .first()
+    )
+    if ativo:
+        return jsonify({"message": "Você já está inscrito em um sorteio dessa especialidade."}), 409
+
+    nova = SorteioAtendimento(
+        paciente_id=paciente_id,
+        profissional_id=None,
+        data_sorteio=agora,
+        data_expiracao=agora + timedelta(days=30)
+    )
+    db.session.add(nova)
+    db.session.commit()
+    return jsonify({"message": "Inscrição criada com sucesso."}), 201
+
+
+@auth_bp.put("/paciente/sorteios/<int:sorteio_id>/renovar")
+@jwt_required()
+def renovar_sorteio(sorteio_id):
+    claims = get_jwt()
+    if claims.get("tipo") != "paciente":
+        return jsonify({"message": "Apenas pacientes podem renovar sorteios."}), 403
+
+    paciente_id = get_jwt_identity()
+    sorteio = SorteioAtendimento.query.filter_by(id=sorteio_id, paciente_id=paciente_id).first()
+    if not sorteio:
+        return jsonify({"message": "Sorteio não encontrado"}), 404
+
+    sorteio.data_sorteio = datetime.utcnow()
+    sorteio.data_expiracao = datetime.utcnow() + timedelta(days=30)
+    db.session.commit()
+    return jsonify({"message": "Prazo renovado com sucesso."}), 200
+
+
+# ------------------------
+# Atendimentos - Profissional
+# ------------------------
+@auth_bp.get("/profissional/atendimentos")
+@jwt_required()
+def listar_atendimentos_profissional():
+    claims = get_jwt()
+    if claims.get("tipo") != "profissional":
+        return jsonify({"message": "Apenas profissionais podem acessar os atendimentos."}), 403
+
+    profissional_id = get_jwt_identity()
+    atendimentos = (
+        Atendimento.query
+        .filter_by(profissional_id=profissional_id)
+        .order_by(Atendimento.data_inicio.desc())
+        .all()
+    )
+    result = [
+        {
+            "id": a.id,
+            "especialidade": a.especialidade,
+            "status": a.status,
+            "paciente": a.paciente.nome if a.paciente else None,
+            "data_inicio": a.data_inicio.isoformat() if a.data_inicio else None,
+            "data_fim": a.data_fim.isoformat() if a.data_fim else None
+        }
+        for a in atendimentos
+    ]
+    return jsonify(result), 200
+
+
+@auth_bp.post("/profissional/atendimentos")
+@jwt_required()
+def criar_atendimento():
+    claims = get_jwt()
+    if claims.get("tipo") != "profissional":
+        return jsonify({"message": "Apenas profissionais podem criar atendimentos."}), 403
+
+    data = request.get_json()
+    paciente_id = data.get("paciente_id")
+    if not paciente_id:
+        return jsonify({"message": "ID do paciente é obrigatório"}), 400
+
+    profissional_id = get_jwt_identity()
+    profissional = User.query.get(profissional_id)
+    paciente = User.query.get(paciente_id)
+    if not profissional or not paciente or paciente.tipo != "paciente":
+        return jsonify({"message": "Paciente não encontrado"}), 404
+
+    novo = Atendimento(
+        profissional_id=profissional.id,
+        paciente_id=paciente.id,
+        especialidade=profissional.especialidade,
+        status="Em atendimento",
+        data_inicio=datetime.utcnow(),
+        data_fim=datetime.utcnow() + timedelta(days=30)
+    )
+    db.session.add(novo)
+    db.session.commit()
+
+    return jsonify({"message": "Atendimento criado com sucesso", "atendimento_id": novo.id}), 201
+
+
+@auth_bp.put("/atendimentos/<int:atendimento_id>/cancelar")
+@jwt_required()
+def cancelar_atendimento(atendimento_id):
+    claims = get_jwt()
+    if claims.get("tipo") != "profissional":
+        return jsonify({"message": "Apenas profissionais podem cancelar atendimentos"}), 403
+
+    profissional_id = get_jwt_identity()
+    atendimento = Atendimento.query.filter_by(id=atendimento_id, profissional_id=profissional_id).first()
+    if not atendimento:
+        return jsonify({"message": "Atendimento não encontrado"}), 404
+
+    data = request.get_json() or {}
+    justificativa = data.get("justificativa", "").strip()
+    if len(justificativa) < 20:
+        return jsonify({"message": "A justificativa deve ter pelo menos 20 caracteres."}), 400
+
+    atendimento.status = "Cancelado pelo profissional"
+    atendimento.justificativa_cancelamento = justificativa
+    SorteioAtendimento.query.filter_by(
+        profissional_id=profissional_id,
+        paciente_id=atendimento.paciente_id
+    ).delete()
+    db.session.commit()
+    return jsonify({"message": "Cancelamento realizado, paciente voltou ao sorteio."}), 200
+
+
+# ------------------------
+# Sorteio pelo Profissional
+# ------------------------
+@auth_bp.get("/sortear-paciente")
+@jwt_required()
+def sortear_paciente():
+    claims = get_jwt()
+    if claims.get("tipo") != "profissional":
+        return jsonify({"message": "Apenas profissionais podem sortear pacientes."}), 403
+
+    profissional = User.query.get(get_jwt_identity())
+    if not profissional:
+        return jsonify({"message": "Profissional não encontrado."}), 404
+
+    ja_sorteados_ids = db.session.query(SorteioAtendimento.paciente_id).filter_by(
+        profissional_id=profissional.id
+    ).subquery()
+
+    candidatos = User.query.filter(
+        User.tipo == "paciente",
+        User.especialidade_necessaria == profissional.especialidade,
+        ~User.id.in_(ja_sorteados_ids)
+    ).all()
+
+    if not candidatos:
+        return jsonify({"message": f"Não há mais pacientes pendentes para a especialidade {profissional.especialidade}."}), 404
+
+    paciente_sorteado = random.choice(candidatos)
+
+    registro = SorteioAtendimento(
+        profissional_id=profissional.id,
+        paciente_id=paciente_sorteado.id,
+        data_sorteio=datetime.utcnow(),
+        data_expiracao=datetime.utcnow() + timedelta(days=30)
+    )
+    db.session.add(registro)
+
+    atendimento = Atendimento(
+        profissional_id=profissional.id,
+        paciente_id=paciente_sorteado.id,
+        especialidade=profissional.especialidade,
+        status="Em atendimento",
+        data_inicio=datetime.utcnow(),
+        data_fim=datetime.utcnow() + timedelta(days=30)
+    )
+    db.session.add(atendimento)
+    db.session.commit()
+
+    assunto = "Você foi sorteado para atendimento"
+    corpo = (
+        f"Olá {paciente_sorteado.nome},\n\n"
+        f"Você foi sorteado para atendimento na especialidade: {paciente_sorteado.especialidade_necessaria}.\n"
+        "Aguarde o contato do profissional.\n"
+    )
+    enviar_email(paciente_sorteado.email, assunto, corpo)
+
+    return jsonify({
+        "message": "Paciente sorteado e atendimento criado.",
+        "paciente": serialize_user(paciente_sorteado),
+        "atendimento": {"id": atendimento.id}
+    }), 200
